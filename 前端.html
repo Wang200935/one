@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>安全路線查詢 – 使用者端</title>
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+
+  <!-- Leaflet Control Geocoder CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.css" />
+
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; }
+    #map { height: 100vh; width: 100vw; }
+
+    .search-container {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+      background: white;
+      padding: 10px;
+      border-radius: 8px;
+      box-shadow: 0 0 8px rgba(0,0,0,0.2);
+      display: flex;
+      gap: 8px;
+    }
+    .search-container input {
+      padding: 6px;
+      width: 180px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    .search-container button {
+      padding: 6px 12px;
+      background: #4285F4;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .search-container button:hover {
+      background: #357AE8;
+    }
+  </style>
+</head>
+<body>
+  <div class="search-container">
+    <input type="text" id="startInput" placeholder="起點 (地址或地名)" />
+    <input type="text" id="endInput" placeholder="終點 (地址或地名)" />
+    <button id="btnPlan">開始規劃</button>
+  </div>
+  <div id="map"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <!-- Leaflet Control Geocoder JS -->
+  <script src="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.js"></script>
+  <script>
+    const orsApiKey = '5b3ce3597851110001cf6248ea5fd77129094e5190f8a24b1c8dcc7d';
+
+    // 初始化地圖
+    const map = L.map('map').setView([25.033964, 121.564468], 14);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    let routeLayer = null;
+    let dangerZones = [];
+    let markersDanger = [];
+    let geocoder = L.Control.Geocoder.nominatim();
+
+    // 從 localStorage 讀取所有危險入口，並顯示紅色圖釘
+    function loadDangerZones() {
+      const stored = localStorage.getItem('danger_zones');
+      dangerZones = stored ? JSON.parse(stored) : [];
+      dangerZones.forEach(zone => {
+        const m = L.marker([zone.lat, zone.lng], {
+          icon: L.icon({
+            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png',
+            iconSize: [25, 41],
+            iconAnchor: [12, 41],
+            popupAnchor: [1, -34],
+            shadowUrl: 'https://unpkg.com/leaflet/dist/images/marker-shadow.png',
+            shadowSize: [41, 41]
+          })
+        }).addTo(map).bindPopup(`<b>危險入口</b><br>${zone.name}`);
+        markersDanger.push(m);
+      });
+    }
+
+    // 將單一欄位拆成兩個欄位 + 自動補全
+    function addAutocomplete(inputId) {
+      const input = document.getElementById(inputId);
+      const control = L.Control.geocoder({ placeholder: '輸入地址' }).addTo(map);
+      // 當使用者在自動完成框內選擇時，就拿到座標並放回 input
+      control.options.geocoder.options.immediate = false;
+      control.on('markgeocode', e => {
+        const center = e.geocode.center;
+        map.setView(center, 17);
+        input.value = e.geocode.name;
+      });
+      input.addEventListener('focus', () => control._input.value = input.value);
+      input.addEventListener('blur', () => setTimeout(() => control._clear(), 200));
+    }
+
+    addAutocomplete('startInput');
+    addAutocomplete('endInput');
+
+    // 點擊「開始規劃」時觸發
+    document.getElementById('btnPlan').addEventListener('click', () => {
+      const startVal = document.getElementById('startInput').value.trim();
+      const endVal = document.getElementById('endInput').value.trim();
+      if (!startVal || !endVal) return alert('請輸入起點與終點');
+      Promise.all([geocode(startVal), geocode(endVal)])
+        .then(([startCoord, endCoord]) => planRoute(startCoord, endCoord))
+        .catch(err => alert(err));
+    });
+
+    // 使用 Nominatim 做地址 → 經緯度
+    function geocode(query) {
+      return fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`)
+        .then(res => res.json())
+        .then(data => {
+          if (!data.length) throw `找不到：${query}`;
+          return [parseFloat(data[0].lat), parseFloat(data[0].lon)];
+        });
+    }
+
+    // 呼叫 ORS API，並避開 danger_zones
+    function planRoute(start, end) {
+      const avoidPolygons = dangerZones.map(p => [[
+        [p.lng - 0.000225, p.lat - 0.000225],
+        [p.lng + 0.000225, p.lat - 0.000225],
+        [p.lng + 0.000225, p.lat + 0.000225],
+        [p.lng - 0.000225, p.lat + 0.000225],
+        [p.lng - 0.000225, p.lat - 0.000225]
+      ]]);
+
+      const body = {
+        coordinates: [[start[1], start[0]], [end[1], end[0]]],
+        options: { avoid_polygons: { type: 'MultiPolygon', coordinates: avoidPolygons } }
+      };
+
+      fetch('https://api.openrouteservice.org/v2/directions/foot-walking/geojson', {
+        method: 'POST',
+        headers: {
+          'Authorization': orsApiKey,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (routeLayer) map.removeLayer(routeLayer);
+        routeLayer = L.geoJSON(data, { style: { color: 'blue', weight: 5 } }).addTo(map);
+        map.fitBounds(routeLayer.getBounds(), { padding: [20, 20] });
+      })
+      .catch(err => alert('路線規劃失敗：' + err));
+    }
+
+    loadDangerZones();
+  </script>
+</body>
+</html>
